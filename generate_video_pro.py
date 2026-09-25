@@ -1088,57 +1088,57 @@ def build_video(telugu_text, english_text, explanation_text):
     glow_frames = make_glow_frames() if GLOW_ON else None
 
     def make_frame(t):
-    t = min(t, total_dur - 1e-3)
-    idx = max(0, min(bisect_right(starts, t) - 1, len(screens) - 1))
-    screen = screens[idx]
-    local_t = t - starts[idx]
+        t = min(t, total_dur - 1e-3)
+        idx = max(0, min(bisect_right(starts, t) - 1, len(screens) - 1))
+        screen = screens[idx]
+        local_t = t - starts[idx]
 
-    frame = bg_provider(t)
+        frame = bg_provider(t)
 
-    # --- Add Twinkling Dust & Neon Waves (Overlay) ---
-    overlay = Image.new("RGB", VIDEO_SIZE, (0,0,0))
-    draw_ov = ImageDraw.Draw(overlay)
-    # Twinkling Dust
-    for i in range(30):
-        seed = i * 123.45
-        px = (int(seed * 1000) + int(t * 50)) % VIDEO_SIZE[0]
-        py = (int(seed * 7000) + int(t * 30)) % VIDEO_SIZE[1]
-        brightness = 150 + 105 * math.sin(t * 3 + seed)
-        draw_ov.ellipse([px-1, py-1, px+1, py+1], fill=(255, 255, 200 if brightness > 200 else 150))
-    # Neon Waves
-    wave_y = VIDEO_SIZE[1] * 0.8 + 40 * math.sin(t * 0.5)
-    draw_ov.line([(0, wave_y), (VIDEO_SIZE[0], wave_y)], fill=GLOW_COLOR, width=2)
-    frame = Image.blend(frame, overlay, 0.3)
+        # --- Add Twinkling Dust & Neon Waves (Overlay) ---
+        overlay = Image.new("RGB", VIDEO_SIZE, (0,0,0))
+        draw_ov = ImageDraw.Draw(overlay)
+        # Twinkling Dust
+        for i in range(30):
+            seed = i * 123.45
+            px = (int(seed * 1000) + int(t * 50)) % VIDEO_SIZE[0]
+            py = (int(seed * 7000) + int(t * 30)) % VIDEO_SIZE[1]
+            brightness = 150 + 105 * math.sin(t * 3 + seed)
+            draw_ov.ellipse([px-1, py-1, px+1, py+1], fill=(255, 255, 200 if brightness > 200 else 150))
+        # Neon Waves
+        wave_y = VIDEO_SIZE[1] * 0.8 + 40 * math.sin(t * 0.5)
+        draw_ov.line([(0, wave_y), (VIDEO_SIZE[0], wave_y)], fill=GLOW_COLOR, width=2)
+        frame = Image.blend(frame, overlay, 0.3)
 
-    if screen["kind"] != "pause":
-        fo = screen["fade_out"]
-        page_alpha = 1.0
-        if local_t > screen["duration"] - fo:
-            page_alpha = ease_out_cubic(max(0.0, (screen["duration"] - local_t) / fo))
-        if page_alpha > 0.01:
-            lf = screen["line_fade"]
-            for line_layer, l_start in zip(screen["line_layers"], screen["line_starts"]):
-                lt = local_t - l_start
-                if lt <= 0: continue
-                prog = min(1.0, lt / lf)
-                l_alpha = ease_out_cubic(prog) * page_alpha
-                if l_alpha <= 0.01: continue
-                rise = int(round((1 - ease_out_cubic(prog)) * LINE_RISE_PIXELS))
-                y = line_layer["y"] - rise
-                layer = line_layer["layer"]
-                if l_alpha < 0.999:
-                    a = np.array(layer, dtype=np.float32)
-                    a[..., 3] *= l_alpha
-                    layer = Image.fromarray(a.astype(np.uint8))
-                frame.paste(layer, (line_layer["x"], y), layer)
+        if screen["kind"] != "pause":
+            fo = screen["fade_out"]
+            page_alpha = 1.0
+            if local_t > screen["duration"] - fo:
+                page_alpha = ease_out_cubic(max(0.0, (screen["duration"] - local_t) / fo))
+            if page_alpha > 0.01:
+                lf = screen["line_fade"]
+                for line_layer, l_start in zip(screen["line_layers"], screen["line_starts"]):
+                    lt = local_t - l_start
+                    if lt <= 0: continue
+                    prog = min(1.0, lt / lf)
+                    l_alpha = ease_out_cubic(prog) * page_alpha
+                    if l_alpha <= 0.01: continue
+                    rise = int(round((1 - ease_out_cubic(prog)) * LINE_RISE_PIXELS))
+                    y = line_layer["y"] - rise
+                    layer = line_layer["layer"]
+                    if l_alpha < 0.999:
+                        a = np.array(layer, dtype=np.float32)
+                        a[..., 3] *= l_alpha
+                        layer = Image.fromarray(a.astype(np.uint8))
+                    frame.paste(layer, (line_layer["x"], y), layer)
 
-    frame_arr = np.array(frame, dtype=np.float32)
-    if glow_frames is not None:
-        # Flash Entry Glow: strength peaks at start of video, then settles
-        flash = 1.0 + 2.0 * math.exp(-t * 2.0)
-        frame_arr += glow_frames[0] * GLOW_STRENGTH * flash
+        frame_arr = np.array(frame, dtype=np.float32)
+        if glow_frames is not None:
+            # Flash Entry Glow: strength peaks at start of video, then settles
+            flash = 1.0 + 2.0 * math.exp(-t * 2.0)
+            frame_arr += glow_frames[0] * GLOW_STRENGTH * flash
 
-    return np.clip(frame_arr, 0, 255).astype(np.uint8)
+        return np.clip(frame_arr, 0, 255).astype(np.uint8)
 
     clip = VideoClip(make_frame, duration=total_dur)
     clip = _compat(clip, "with_fps", "set_fps", FPS)

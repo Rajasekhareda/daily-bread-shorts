@@ -1011,7 +1011,6 @@ def prepare_audio(music_path, duration, volume=0.85):
 
 def build_video(telugu_text, english_text, explanation_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
     pick_gradient_palette()  # pins palette + text tint for this video
 
@@ -1089,47 +1088,57 @@ def build_video(telugu_text, english_text, explanation_text):
     glow_frames = make_glow_frames() if GLOW_ON else None
 
     def make_frame(t):
-        t = min(t, total_dur - 1e-3)
-        idx = max(0, min(bisect_right(starts, t) - 1, len(screens) - 1))
-        screen = screens[idx]
-        local_t = t - starts[idx]
+    t = min(t, total_dur - 1e-3)
+    idx = max(0, min(bisect_right(starts, t) - 1, len(screens) - 1))
+    screen = screens[idx]
+    local_t = t - starts[idx]
 
-        frame = bg_provider(t)
+    frame = bg_provider(t)
 
-        if screen["kind"] != "pause":
-            fo = screen["fade_out"]
-            page_alpha = 1.0
-            if local_t > screen["duration"] - fo:
-                page_alpha = ease_out_cubic(
-                    max(0.0, (screen["duration"] - local_t) / fo))
+    # --- Add Twinkling Dust & Neon Waves (Overlay) ---
+    overlay = Image.new("RGB", VIDEO_SIZE, (0,0,0))
+    draw_ov = ImageDraw.Draw(overlay)
+    # Twinkling Dust
+    for i in range(30):
+        seed = i * 123.45
+        px = (int(seed * 1000) + int(t * 50)) % VIDEO_SIZE[0]
+        py = (int(seed * 7000) + int(t * 30)) % VIDEO_SIZE[1]
+        brightness = 150 + 105 * math.sin(t * 3 + seed)
+        draw_ov.ellipse([px-1, py-1, px+1, py+1], fill=(255, 255, 200 if brightness > 200 else 150))
+    # Neon Waves
+    wave_y = VIDEO_SIZE[1] * 0.8 + 40 * math.sin(t * 0.5)
+    draw_ov.line([(0, wave_y), (VIDEO_SIZE[0], wave_y)], fill=GLOW_COLOR, width=2)
+    frame = Image.blend(frame, overlay, 0.3)
 
-            if page_alpha > 0.01:
-                lf = screen["line_fade"]
-                for line_layer, l_start in zip(screen["line_layers"],
-                                               screen["line_starts"]):
-                    lt = local_t - l_start
-                    if lt <= 0:
-                        continue
-                    prog = min(1.0, lt / lf)
-                    l_alpha = ease_out_cubic(prog) * page_alpha
-                    if l_alpha <= 0.01:
-                        continue
-                    rise = int(round((1 - ease_out_cubic(prog)) * LINE_RISE_PIXELS))
-                    y = line_layer["y"] - rise
-                    layer = line_layer["layer"]
-                    if l_alpha < 0.999:
-                        a = np.array(layer, dtype=np.float32)
-                        a[..., 3] *= l_alpha
-                        layer = Image.fromarray(a.astype(np.uint8))
-                    frame.paste(layer, (line_layer["x"], y), layer)
+    if screen["kind"] != "pause":
+        fo = screen["fade_out"]
+        page_alpha = 1.0
+        if local_t > screen["duration"] - fo:
+            page_alpha = ease_out_cubic(max(0.0, (screen["duration"] - local_t) / fo))
+        if page_alpha > 0.01:
+            lf = screen["line_fade"]
+            for line_layer, l_start in zip(screen["line_layers"], screen["line_starts"]):
+                lt = local_t - l_start
+                if lt <= 0: continue
+                prog = min(1.0, lt / lf)
+                l_alpha = ease_out_cubic(prog) * page_alpha
+                if l_alpha <= 0.01: continue
+                rise = int(round((1 - ease_out_cubic(prog)) * LINE_RISE_PIXELS))
+                y = line_layer["y"] - rise
+                layer = line_layer["layer"]
+                if l_alpha < 0.999:
+                    a = np.array(layer, dtype=np.float32)
+                    a[..., 3] *= l_alpha
+                    layer = Image.fromarray(a.astype(np.uint8))
+                frame.paste(layer, (line_layer["x"], y), layer)
 
-        frame_arr = np.array(frame, dtype=np.float32)
-        if glow_frames is not None:
-            loop_t = (t * GLOW_REVOLUTIONS) % 1.0
-            gi = int(loop_t * GLOW_FRAMES) % GLOW_FRAMES
-            frame_arr += glow_frames[gi] * GLOW_STRENGTH
+    frame_arr = np.array(frame, dtype=np.float32)
+    if glow_frames is not None:
+        # Flash Entry Glow: strength peaks at start of video, then settles
+        flash = 1.0 + 2.0 * math.exp(-t * 2.0)
+        frame_arr += glow_frames[0] * GLOW_STRENGTH * flash
 
-        return np.clip(frame_arr, 0, 255).astype(np.uint8)
+    return np.clip(frame_arr, 0, 255).astype(np.uint8)
 
     clip = VideoClip(make_frame, duration=total_dur)
     clip = _compat(clip, "with_fps", "set_fps", FPS)
@@ -1176,59 +1185,10 @@ def build_video(telugu_text, english_text, explanation_text):
         ffmpeg_params=["-pix_fmt", "yuv420p"],
     )
 
-    thumbnail_path = generate_thumbnail(telugu_text, english_text,
-                                         telugu_font_path, latin_font_path,
-                                         font_size)
-    return output_path, thumbnail_path
+    return output_path
 
 
-def generate_thumbnail(telugu_text, english_text, telugu_font_path,
-                       latin_font_path, font_size):
-    """Vertical (9:16) Shorts thumbnail."""
-    thumb_size = (720, 1280)
-    bg_img = _cover_resize(create_background().resize(
-        (int(thumb_size[0] * 0.67), int(thumb_size[1] * 0.67)), _LANCZOS))
 
-    display_text = telugu_text or english_text or "Daily Bible Verse"
-    use_telugu = is_telugu(display_text)
-    font_path = telugu_font_path if use_telugu else latin_font_path
-
-    safe_w = int(thumb_size[0] * 0.86)
-    fs = int(thumb_size[0] * 0.115)
-    fb = latin_font_path if use_telugu else None
-    lines = wrap_text(display_text, font_path, fs, safe_w, fallback_path=fb)[:3]
-
-    draw = ImageDraw.Draw(bg_img)
-    stroke_w = max(1, fs // 30)
-    text_fill = text_accent_color()
-    line_h = int(fs * 1.4)
-    top = (thumb_size[1] - line_h * len(lines)) // 2
-    for i, line in enumerate(lines):
-        if use_telugu and _HAS_SHAPING:
-            img, w = render_line_layer(line, font_path, fs, text_fill,
-                                         fallback_path=latin_font_path)
-            bg_img.paste(img, ((thumb_size[0] - img.size[0]) // 2,
-                               top + i * line_h), img)
-            continue
-        font = load_font(font_path, fs)
-        w = draw.textlength(line, font=font)
-        draw.text(((thumb_size[0] - w) / 2, top + i * line_height_safe(fs)),
-                  line, font=font, fill=text_fill,
-                  stroke_width=stroke_w, stroke_fill=(0, 0, 0))
-
-    label_font = load_font(latin_font_path, int(fs * 0.32))
-    draw.text((36, thumb_size[1] - int(fs * 0.32) - 36), "DAILY VERSE",
-              font=label_font, fill=(235, 200, 120),
-              stroke_width=2, stroke_fill=(0, 0, 0))
-
-    timestamp = int(time.time())
-    thumbnail_path = os.path.join(THUMBNAIL_DIR, f"thumbnail_{timestamp}.jpg")
-    bg_img.convert("RGB").save(thumbnail_path, "JPEG", quality=95)
-    return thumbnail_path
-
-
-def line_height_safe(fs):
-    return int(fs * 1.4) - int(fs * 0.25)
 
 # ===================================================================
 # Google Sheets / YouTube integration
@@ -1386,9 +1346,8 @@ def run_test_render():
         "For God so loved the world that he gave his one and only Son, that whoever "
         "believes in him shall not perish but have eternal life. (John 3:16)"
     )
-    video_path, thumbnail_path = build_video(telugu_text, english_text, "")
+    video_path = build_video(telugu_text, english_text, "")
     print(f"Test video created at:     {video_path}")
-    print(f"Test thumbnail created at: {thumbnail_path}")
 
 
 def run_production():
@@ -1410,9 +1369,8 @@ def run_production():
     english_text = sanitize_text(english_text)
     explanation_text = sanitize_text(explanation_text)
 
-    video_path, thumbnail_path = build_video(telugu_text, english_text, explanation_text)
+    video_path = build_video(telugu_text, english_text, explanation_text)
     print(f"Generated video: {video_path}")
-    print(f"Generated thumbnail: {thumbnail_path}")
 
     youtube_service = get_youtube_service(creds)
     vid = upload_to_youtube(youtube_service, video_path, telugu_text, english_text)

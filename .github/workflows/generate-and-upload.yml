@@ -1,0 +1,58 @@
+name: Generate and Upload Verse Short
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: generate-and-upload
+  cancel-in-progress: true
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system packages (ffmpeg + Unicode/Telugu fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto fonts-noto-core fonts-noto-extra
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the video generator
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_TAB: ${{ secrets.SHEET_TAB }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVEN_VOICE_TELUGU: ${{ secrets.ELEVEN_VOICE_TELUGU }}
+          ELEVEN_VOICE_ENGLISH: ${{ secrets.ELEVEN_VOICE_ENGLISH }}
+          # Optional: auto-release at a future RFC3339 UTC time (video stays private until then)
+          # PUBLISH_AT: "2026-09-10T09:00:00Z"
+          PRIVACY_STATUS: private
+          # Background: gif (random scenic GIF) | gradient | image | video
+          BACKGROUND_MODE: gif
+        run: python generate_video_pro.py
+
+      - name: Upload output as workflow artifact (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verse-short-output
+          path: output/
+          retention-days: 7

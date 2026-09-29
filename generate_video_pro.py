@@ -73,11 +73,22 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-from google.oauth2 import service_account
-from google.oauth2.credentials import Credentials as UserCredentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
+# Google API libs are only needed for production (Sheets + YouTube upload).
+# Keep the import optional so --test renders work without them installed.
+try:
+    from google.oauth2 import service_account
+    from google.oauth2.credentials import Credentials as UserCredentials
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaFileUpload
+    _HAS_GOOGLE = True
+except ImportError:
+    _HAS_GOOGLE = False
+    service_account = UserCredentials = build = MediaFileUpload = None
+
+    class HttpError(Exception):
+        """Placeholder so `except HttpError` stays valid without google libs."""
+        resp = None
 
 # ================= SHEET LAYOUT =================
 # Column A = Telugu verse text
@@ -145,13 +156,17 @@ TEXT_ACCENTS = {
 }
 DEFAULT_TEXT_ACCENT = (255, 244, 224)
 
-# ============ GOOGLE STUDIO EDGE GLOW ============
-# Static, high-quality soft glow around the border
+# ============ NEON EDGE GLOW ============
+# SILENT hairline edge: one STATIC glow tracing the whole border -
+# a crisp rounded-rectangle core line with a two-stage soft halo.
 GLOW_ON = True
-GLOW_LINE_W = 2           # Width of the core glow line
-GLOW_BLUR = 15            # Wider blur for a 'studio' soft look
-GLOW_STRENGTH = 1.2       # Blend factor
-GLOW_COLOR = (255, 246, 224)  # Warm white-gold glow
+GLOW_LINE_W = 3          # crisp core stroke, full-res px
+GLOW_HALO_TIGHT = 8      # inner halo blur radius, full-res px
+GLOW_HALO_WIDE = 32      # outer ambient bleed blur radius, full-res px
+GLOW_INSET_RATIO = 0.028     # border distance from the frame edge
+GLOW_CORNER_RATIO = 0.055    # rounded-corner radius (of min side)
+GLOW_STRENGTH = 0.80     # master intensity of the additive glow
+GLOW_COLOR = (255, 246, 224)  # warm white-gold, matches the text
 
 # ============ BACKGROUNDS (SHORTS: scenic animated GIFs) ============
 # BACKGROUND_MODE: gif (default) | gradient | image | video
@@ -219,25 +234,28 @@ _REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUNDLED_FONT = os.path.join(_REPO_DIR, "NotoSerifMerged-Bold.ttf")
 _TELUGU_FONT = os.path.join(_REPO_DIR, "NotoSerifTelugu-Bold.ttf")
 
-# Clean system fonts first; bundled fonts are last resort to avoid box glyphs
+# Clean system fonts first; the merged bundle font is the LAST resort
+# (a bad font merge can break the cmap -> box glyphs and broken digits).
 FONT_CANDIDATES_TELUGU = [p for p in [
     FONT_PATH_TELUGU_ENV,
-    r"C:\Windows\Fonts\NirmalaB.ttf",
-    r"C:\Windows\Fonts\Nirmala.ttf",
     "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansTelugu-Bold.ttf",
-    "/System/Library/Fonts/Supplemental/NotoSansTelugu-Regular.ttf",
     _TELUGU_FONT,
+    r"C:\Windows\Fonts\NirmalaB.ttf",
+    r"C:\Windows\Fonts\Nirmala.ttf",
+    "/System/Library/Fonts/Supplemental/NotoSansTelugu-Regular.ttf",
     _BUNDLED_FONT,
 ] if p and os.path.isfile(p)]
 
+# Latin: system fonts first; merged bundle LAST resort (it produced
+# box glyphs for English text on the Actions runner).
 FONT_CANDIDATES_LATIN = [p for p in [
     FONT_PATH_LATIN_ENV,
+    "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
     r"C:\Windows\Fonts\georgia.ttf",
     r"C:\Windows\Fonts\segoeuib.ttf",
     r"C:\Windows\Fonts\arialbd.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     _BUNDLED_FONT,
 ] if p and os.path.isfile(p)]
@@ -285,9 +303,15 @@ _PUNCT_MAP = {
 
 
 def sanitize_text(text):
-    """Normalize punctuation/whitespace but KEEP all Unicode letters."""
+    """Normalize punctuation/whitespace but KEEP all Unicode letters.
+
+    Sheet cells often contain LITERAL backslash-n sequences (typed as
+    two characters by AI verse generators); those show as visible junk
+    in the video, so strip them before anything else.
+    """
     if text is None:
         return text
+    text = text.replace("\\n", " ").replace("\\r", " ")
     for bad, good in _PUNCT_MAP.items():
         text = text.replace(bad, good)
     text = text.replace("\n", " ").replace("\t", " ")
@@ -332,21 +356,39 @@ def generate_hashtags(telugu_text, english_text):
 # ===================================================================
 
 _FONT_CACHE = {}
+_HAS_RAQM = None
 
 
 def load_font(font_path, size):
+    """Load (and cache) a font. Prefer the RAQM layout engine when this
+    Pillow build has it: RAQM shapes complex scripts (Telugu conjuncts,
+    vowel signs) correctly and gives Latin proper kerning too."""
     key = (font_path, size)
     if key in _FONT_CACHE:
         return _FONT_CACHE[key]
     try:
-        font = ImageFont.truetype(font_path, size) if font_path else None
-        if font is None:
+        if not font_path:
             raise OSError("no font path")
-    except OSError:
+        if _raqm_available():
+            font = ImageFont.truetype(font_path, size,
+                                      layout_engine=ImageFont.Layout.RAQM)
+        else:
+            font = ImageFont.truetype(font_path, size)
+    except (OSError, ValueError):
         print(f"WARNING: could not load font at '{font_path}'.")
         font = ImageFont.load_default()
     _FONT_CACHE[key] = font
     return font
+
+
+def _raqm_available():
+    global _HAS_RAQM
+    if _HAS_RAQM is None:
+        try:
+            _HAS_RAQM = bool(ImageFont.core.HAVE_RAQM)
+        except Exception:
+            _HAS_RAQM = False
+    return _HAS_RAQM
 
 
 def resolve_font_path(candidates, script_key):
@@ -356,17 +398,101 @@ def resolve_font_path(candidates, script_key):
     return None
 
 
+# ------------------------------------------------------------------
+# Script-run segmentation: a line may mix Telugu and Latin. Every run
+# must render with its OWN font - pushing English through a Telugu
+# shaping path (or Telugu through a plain Latin font) is exactly what
+# "breaks" the English text on mixed lines.
+# ------------------------------------------------------------------
+
+_SCRIPT_FONT_CACHE = {}
+
+
+def _font_for_script(want_telugu, default_path=None, fallback_path=None):
+    """Best font file for one script run: the resolved per-script font
+    first, then the caller's own paths."""
+    key = bool(want_telugu)
+    if key not in _SCRIPT_FONT_CACHE:
+        cands = FONT_CANDIDATES_TELUGU if key else FONT_CANDIDATES_LATIN
+        _SCRIPT_FONT_CACHE[key] = resolve_font_path(
+            cands, "telugu" if key else "latin")
+    return _SCRIPT_FONT_CACHE[key] or default_path or fallback_path
+
+
+def _grapheme_clusters(text):
+    """Split into grapheme clusters - never tear a base character from
+    its combining marks, virama-joined consonants or ZWJ sequences, so
+    hard-breaking a long word cannot split a Telugu conjunct apart."""
+    clusters = []
+    cur = ""
+    for ch in text:
+        if not cur:
+            cur = ch
+            continue
+        prev = cur[-1]
+        joins = (
+            unicodedata.combining(ch) > 0
+            or unicodedata.category(ch) in ("Mn", "Mc", "Me")
+            or ch in ("\u200c", "\u200d", "\u2060", "\ufeff")
+            or prev in ("\u200d", "\u0c4d")      # ZWJ / Telugu virama
+        )
+        if joins:
+            cur += ch
+        else:
+            clusters.append(cur)
+            cur = ch
+    if cur:
+        clusters.append(cur)
+    return clusters
+
+
+def split_script_runs(text):
+    """[(substring, is_telugu_run), ...] - alternating script runs.
+
+    Whitespace is script-neutral and stays attached to the run before
+    it, so a pure Telugu sentence is ONE run (and keeps the full-line
+    shaped renderer) instead of splitting at every space.
+    """
+    runs = []
+    pending = []
+    for cluster in _grapheme_clusters(text or ""):
+        if cluster.isspace():
+            (runs[-1][0] if runs else pending).append(cluster)
+            continue
+        flag = is_telugu(cluster)
+        if runs and runs[-1][1] == flag:
+            runs[-1][0].append(cluster)
+        else:
+            runs.append((pending + [cluster], flag))
+            pending = []
+    if pending:
+        if runs:
+            runs[-1][0].extend(pending)
+        else:
+            runs.append((pending, False))
+    return [("".join(parts), flag) for parts, flag in runs]
+
+
 def measure_text(text, font_path, font_size, fallback_path=None):
-    """Width in px; Telugu measured through HarfBuzz shaping so wrapped
-    widths match what actually renders."""
-    if _HAS_SHAPING and is_telugu(text):
-        return _shape_line(text, font_path, font_size, fallback_path).width
-    font = load_font(font_path, font_size)
-    return font.getlength(text)
+    """Width in px, measured per script run so shaped Telugu widths and
+    Latin metrics both match what actually renders."""
+    total = 0.0
+    for run_text, run_telugu in split_script_runs(text):
+        if _HAS_SHAPING and run_telugu:
+            total += _shape_line(run_text,
+                                 _font_for_script(True, font_path, fallback_path),
+                                 font_size,
+                                 _font_for_script(False, font_path, fallback_path)
+                                 ).width
+        else:
+            run_path = _font_for_script(run_telugu, font_path, fallback_path)
+            total += load_font(run_path, font_size).getlength(run_text)
+    return total
 
 
 def wrap_text(text, font_path, font_size, max_width, fallback_path=None):
-    """Word-wrap by shaped width; hard-break a too-long word."""
+    """Word-wrap by shaped width; hard-break a too-long word by grapheme
+    clusters (never mid-conjunct, never mid-mark)."""
     def mw(s):
         return measure_text(s, font_path, font_size, fallback_path)
 
@@ -380,15 +506,13 @@ def wrap_text(text, font_path, font_size, max_width, fallback_path=None):
             else:
                 lines.append(word)
         else:
-            # hard-break the long word character by character
             piece = ""
-            for ch in word:
-                if mw(piece + ch) <= max_width:
-                    piece += ch
+            for cluster in _grapheme_clusters(word):
+                if piece and mw(piece + cluster) > max_width:
+                    lines.append(piece)
+                    piece = cluster
                 else:
-                    if piece:
-                        lines.append(piece)
-                    piece = ch
+                    piece += cluster
             if piece:
                 lines.append(piece)
     return lines or [""]
@@ -624,8 +748,8 @@ def _vignette_mask():
     return _VIGNETTE_MASK
 
 
-def _cover_resize(img):
-    w, h = VIDEO_SIZE
+def _cover_resize(img, size=None):
+    w, h = size or VIDEO_SIZE
     iw, ih = img.size
     if (iw, ih) == (w, h):
         return img
@@ -693,18 +817,30 @@ def _parse_duration_hint(im, default=100):
 
 
 def _ken_burns_base(img):
-    """Oversized base for a slow cinematic zoom."""
-    big = img.resize((int(VIDEO_SIZE[0] * 1.15), int(VIDEO_SIZE[1] * 1.15)), _LANCZOS)
+    """Oversized, sharpened base for a slow cinematic zoom (Ken Burns)."""
+    big = img.resize((int(VIDEO_SIZE[0] * 1.12), int(VIDEO_SIZE[1] * 1.12)),
+                     _LANCZOS)
     return big.filter(ImageFilter.UnsharpMask(radius=2, percent=55, threshold=3))
+
 
 def _kb_window(base, t):
     """Crop the Ken Burns window for time t (slow zoom-in 1.0 -> 1.10)."""
     zoom = 1.0 + 0.10 * max(0.0, min(t / max(0.1, TOTAL_DURATION), 1.0))
-    cw = max(1, int(base.width / zoom))
-    ch = max(1, int(base.height / zoom))
-    x0 = (base.width - cw) // 2
-    y0 = (base.height - ch) // 2
-    return base.crop((x0, y0, x0 + cw, y0 + ch)).resize(VIDEO_SIZE, _LANCZOS)
+    key = int(zoom * 100)
+    cache = getattr(_kb_window, "_cache", None)
+    if cache is None:
+        cache = _kb_window._cache = {}
+    if key not in cache:
+        cw = max(1, int(base.width / zoom))
+        ch = max(1, int(base.height / zoom))
+        x0 = (base.width - cw) // 2
+        y0 = (base.height - ch) // 2
+        window = base.crop((x0, y0, x0 + cw, y0 + ch)).resize(VIDEO_SIZE, _LANCZOS)
+        if len(cache) > 14:
+            cache.clear()
+        cache[key] = window
+    return cache[key]
+
 
 def make_gif_bg(path):
     frames = []
@@ -714,18 +850,19 @@ def make_gif_bg(path):
         step = max(1, math.ceil(n_total / GIF_FRAME_CAP))
         for i in range(0, n_total, step):
             im.seek(i)
-            frames.append(_ken_burns_base(_finish_still(im, IMAGE_DIM)))
+            frames.append(_finish_still(im, IMAGE_DIM))
             offsets.append(offsets[-1] + max(0.02, _parse_duration_hint(im) / 1000.0))
             if len(frames) >= GIF_FRAME_CAP:
                 break
     if not frames:
         return make_gradient_bg()
     total = offsets[-1]
+    kb_frames = [_ken_burns_base(f) for f in frames]
 
     def provider(t):
         tt = t % total if total > 0 else 0.0
         k = max(0, min(bisect_right(offsets, tt) - 1, len(frames) - 1))
-        return _kb_window(frames[k], t).copy()
+        return _kb_window(kb_frames[k], t).copy()
 
     return provider
 
@@ -852,43 +989,49 @@ def resolve_background():
 
 
 # ===================================================================
-# Neon edge glow: a thin ray that spins fast around the border
+# Neon edge glow: static hairline tracing the whole border
 # ===================================================================
 
 _GLOW_FRAMES_CACHE = None
-GLOW_FRAMES = 90  # steps per revolution (precomputed)
 
 
-def _edge_points():
-    """Perimeter points of the frame, evenly spaced (36 per side +)."""
+def _glow_core_mask():
+    """Crisp anti-aliased rounded-rectangle hairline (alpha mask).
+
+    Drawn at 2x supersampling and downscaled, so the line stays smooth -
+    unlike the old blurred quarter-res stroke, which showed up as a
+    fuzzy uneven band instead of a neon hairline.
+    """
     w, h = VIDEO_SIZE
-    m = int(min(w, h) * 0.025)
-    pts = []
-    x0, y0, x1, y1 = m, m, w - m, h - m
-    n = 40
-    for i in range(n):
-        pts.append((x0 + (x1 - x0) * i / n, y0))
-    for i in range(1, n):
-        pts.append((x1, y0 + (y1 - y0) * i / n))
-    for i in range(1, n):
-        pts.append((x1 - (x1 - x0) * i / n, y1))
-    for i in range(1, n):
-        pts.append((x0, y1 - (y1 - y0) * i / n))
-    return pts
+    ss = 2
+    inset = int(min(w, h) * GLOW_INSET_RATIO)
+    radius = int(min(w, h) * GLOW_CORNER_RATIO)
+    big = Image.new("L", (w * ss, h * ss), 0)
+    d = ImageDraw.Draw(big)
+    d.rounded_rectangle(
+        [inset * ss, inset * ss, (w - inset) * ss, (h - inset) * ss],
+        radius=radius * ss, outline=255, width=max(1, GLOW_LINE_W * ss))
+    return big.resize((w, h), _LANCZOS)
 
 
 def make_glow_frames():
-    """A single STATIC glow frame: a high-quality soft hairline tracing the border."""
+    """A single STATIC glow frame: a hairline tracing the ENTIRE border.
+
+    Three stacked layers give a clean neon look without muddiness:
+    crisp core + tight halo + wide ambient bleed. Silent edge treatment -
+    no spinning ray, no pulse, no hue drift.
+    """
     global _GLOW_FRAMES_CACHE
     if _GLOW_FRAMES_CACHE is not None:
         return _GLOW_FRAMES_CACHE
-    qw, qh = VIDEO_SIZE[0] // 4, VIDEO_SIZE[1] // 4
-    pts = [(x / 4, y / 4) for x, y in _edge_points()]
-    img = Image.new("RGB", (qw, qh), (0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.line(pts + [pts[0]], fill=GLOW_COLOR, width=GLOW_LINE_W)
-    img = img.filter(ImageFilter.GaussianBlur(GLOW_BLUR))
-    frame = np.array(img.resize(VIDEO_SIZE, _LANCZOS), dtype=np.float32)
+    core = _glow_core_mask()
+    tight = core.filter(ImageFilter.GaussianBlur(GLOW_HALO_TIGHT))
+    wide = core.filter(ImageFilter.GaussianBlur(GLOW_HALO_WIDE))
+    c = np.asarray(core, dtype=np.float32) / 255.0
+    t = np.asarray(tight, dtype=np.float32) / 255.0
+    wd = np.asarray(wide, dtype=np.float32) / 255.0
+    alpha = np.clip(1.00 * c + 0.55 * t + 0.30 * wd, 0.0, 1.0) * GLOW_STRENGTH
+    frame = alpha[..., None] * np.asarray(GLOW_COLOR, dtype=np.float32)
     _GLOW_FRAMES_CACHE = [frame]
     return _GLOW_FRAMES_CACHE
 
@@ -896,34 +1039,108 @@ def make_glow_frames():
 # Line rendering: pre-rendered layers, shaped for Telugu
 # ===================================================================
 
+def _vertical_gradient(size, top_rgb, bottom_rgb):
+    """RGBA vertical gradient image (top -> bottom)."""
+    w, h = size
+    col = Image.new("RGB", (1, max(2, h)))
+    px = col.load()
+    for y in range(col.size[1]):
+        r = y / (col.size[1] - 1)
+        px[0, y] = (int(top_rgb[0] * (1 - r) + bottom_rgb[0] * r),
+                    int(top_rgb[1] * (1 - r) + bottom_rgb[1] * r),
+                    int(top_rgb[2] * (1 - r) + bottom_rgb[2] * r))
+    return col.resize((max(1, w), h), _LANCZOS).convert("RGBA")
+
+
+def _render_pil_run(run_text, run_path, font_size, fill_rgba, gradient,
+                    stroke_w):
+    """Rasterize one script run with PIL as an RGBA layer.
+
+    Returns (layer, advance_px, baseline_px) where baseline_px is the
+    distance from the layer top to the text baseline.
+    """
+    font = load_font(run_path, font_size)
+    ascent, descent = font.getmetrics()
+    advance = int(math.ceil(font.getlength(run_text)))
+    pad_x = stroke_w + 6
+    pad_y = stroke_w + 8
+    baseline = pad_y + ascent
+    img = Image.new("RGBA", (max(1, advance + pad_x * 2),
+                             baseline + descent + pad_y), (0, 0, 0, 0))
+
+    # coverage masks: glyph core, and glyph + stroke outline
+    m_core = Image.new("L", img.size, 0)
+    m_strk = Image.new("L", img.size, 0)
+    for mask, sw in ((m_strk, stroke_w), (m_core, 0)):
+        ImageDraw.Draw(mask).text((pad_x, pad_y), run_text, font=font,
+                                  fill=255, stroke_width=sw, stroke_fill=255)
+
+    m_shadow = Image.new("L", img.size, 0)
+    m_shadow.paste(m_core, (2, 2))
+    img.paste(Image.new("RGBA", img.size, (0, 0, 0, 150)), (0, 0), m_shadow)
+    img.paste(Image.new("RGBA", img.size, STROKE_COLOR), (0, 0), m_strk)
+    if gradient is not None:
+        fill_img = _vertical_gradient(img.size, gradient[0], gradient[1])
+    else:
+        fill_img = Image.new("RGBA", img.size, fill_rgba)
+    img.paste(fill_img, (0, 0), m_core)
+    return img, advance, baseline
+
+
 def render_line_layer(text, font_path, font_size, text_fill, fallback_path=None):
     """Render one line as an RGBA layer.
 
-    Telugu (and any complex script) goes through the shaped path
-    (HarfBuzz + FreeType) so conjuncts are correct, with a golden
-    gradient fill and per-glyph fallback for missing glyphs
-    (digits/parens). Latin uses PIL, unchanged.
+    The line is split into SCRIPT RUNS first. Telugu runs go through the
+    shaped path (HarfBuzz/RAQM) with the golden gradient; Latin runs use
+    PIL with the palette accent and their own font. Pushing English
+    through the Telugu shaping path (or vice versa) is what used to
+    break the English text on mixed Telugu+English lines.
     Returns (layer PIL RGBA, width_px).
     """
     stroke_w = max(2, font_size // 24)
-    use_shaped = _HAS_SHAPING and is_telugu(text)
-    if use_shaped:
+    runs = split_script_runs(text)
+
+    # A pure Telugu line keeps the existing shaped renderer untouched.
+    if _HAS_SHAPING and is_telugu(text) and len(runs) == 1:
         img, _baseline = _render_shaped_layer(
-            text, font_path, font_size, fallback_path=fallback_path,
+            text, _font_for_script(True, font_path, fallback_path),
+            font_size,
+            fallback_path=_font_for_script(False, font_path, fallback_path),
             fill_top=TELUGU_GRADIENT_TOP, fill_bottom=TELUGU_GRADIENT_BOTTOM,
             stroke_width=stroke_w, stroke_fill=STROKE_COLOR[:3])
         return img, img.size[0]
-    font = load_font(font_path, font_size)
-    pad = max(8, stroke_w * 3)
-    w = int(measure_text(text, font_path, font_size))
-    h = int(font_size * 1.9)
-    img = Image.new("RGBA", (w + pad * 2, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.text((pad + 2, h // 2 - font_size // 2 + 2), text, font=font,
-              fill=(0, 0, 0, 150))
-    draw.text((pad, h // 2 - font_size // 2), text, font=font, fill=text_fill,
-              stroke_width=stroke_w, stroke_fill=STROKE_COLOR)
-    return img, w
+
+    rendered = []   # (layer, advance_px, baseline_px)
+    for run_text, run_telugu in runs:
+        run_path = _font_for_script(run_telugu, font_path, fallback_path)
+        if _HAS_SHAPING and run_telugu:
+            img, base = _render_shaped_layer(
+                run_text, run_path, font_size,
+                fallback_path=_font_for_script(False, font_path, fallback_path),
+                fill_top=TELUGU_GRADIENT_TOP, fill_bottom=TELUGU_GRADIENT_BOTTOM,
+                stroke_width=stroke_w, stroke_fill=STROKE_COLOR[:3])
+            if not base:
+                base = img.size[1] * 0.78
+            rendered.append((img, img.size[0], base))
+        else:
+            gradient = ((TELUGU_GRADIENT_TOP, TELUGU_GRADIENT_BOTTOM)
+                        if run_telugu else None)
+            rendered.append(_render_pil_run(run_text, run_path, font_size,
+                                            text_fill, gradient, stroke_w))
+    if not rendered:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 1
+
+    pad_x = stroke_w + 6
+    baseline = max(b for _, _, b in rendered)
+    below = max(img.size[1] - b for img, _, b in rendered)
+    width = int(sum(adv for _, adv, _ in rendered)) + pad_x * 2
+    canvas = Image.new("RGBA", (max(1, width),
+                                max(1, int(baseline + below))), (0, 0, 0, 0))
+    x = pad_x
+    for img, adv, base in rendered:
+        canvas.paste(img, (int(x - pad_x), int(baseline - base)), img)
+        x += adv
+    return canvas, canvas.size[0]
 
 
 def build_line_layers(screens, font_size, fallback_font_path=None):
@@ -1011,6 +1228,7 @@ def prepare_audio(music_path, duration, volume=0.85):
 
 def build_video(telugu_text, english_text, explanation_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
     pick_gradient_palette()  # pins palette + text tint for this video
 
@@ -1018,6 +1236,11 @@ def build_video(telugu_text, english_text, explanation_text):
     latin_font_path = resolve_font_path(FONT_CANDIDATES_LATIN, "latin")
     if telugu_text and not telugu_font_path:
         print("WARNING: no Telugu font resolved.")
+    if telugu_text and not _HAS_SHAPING and not _raqm_available():
+        print("WARNING: no complex-text shaping backend (shaped_text.py or "
+              "a Pillow-with-raqm build); Telugu conjuncts may render broken."
+              " Install uharfbuzz + add shaped_text.py, or use a Pillow "
+              "build with raqm.")
     if english_text and not latin_font_path:
         print("WARNING: no Latin font resolved.")
 
@@ -1095,34 +1318,24 @@ def build_video(telugu_text, english_text, explanation_text):
 
         frame = bg_provider(t)
 
-        # --- Add Twinkling Dust & Neon Waves (Overlay) ---
-        overlay = Image.new("RGB", VIDEO_SIZE, (0,0,0))
-        draw_ov = ImageDraw.Draw(overlay)
-        # Twinkling Dust
-        for i in range(30):
-            seed = i * 123.45
-            px = (int(seed * 1000) + int(t * 50)) % VIDEO_SIZE[0]
-            py = (int(seed * 7000) + int(t * 30)) % VIDEO_SIZE[1]
-            brightness = 150 + 105 * math.sin(t * 3 + seed)
-            draw_ov.ellipse([px-1, py-1, px+1, py+1], fill=(255, 255, 200 if brightness > 200 else 150))
-        # Neon Waves
-        wave_y = VIDEO_SIZE[1] * 0.8 + 40 * math.sin(t * 0.5)
-        draw_ov.line([(0, wave_y), (VIDEO_SIZE[0], wave_y)], fill=GLOW_COLOR, width=2)
-        frame = Image.blend(frame, overlay, 0.3)
-
         if screen["kind"] != "pause":
             fo = screen["fade_out"]
             page_alpha = 1.0
             if local_t > screen["duration"] - fo:
-                page_alpha = ease_out_cubic(max(0.0, (screen["duration"] - local_t) / fo))
+                page_alpha = ease_out_cubic(
+                    max(0.0, (screen["duration"] - local_t) / fo))
+
             if page_alpha > 0.01:
                 lf = screen["line_fade"]
-                for line_layer, l_start in zip(screen["line_layers"], screen["line_starts"]):
+                for line_layer, l_start in zip(screen["line_layers"],
+                                               screen["line_starts"]):
                     lt = local_t - l_start
-                    if lt <= 0: continue
+                    if lt <= 0:
+                        continue
                     prog = min(1.0, lt / lf)
                     l_alpha = ease_out_cubic(prog) * page_alpha
-                    if l_alpha <= 0.01: continue
+                    if l_alpha <= 0.01:
+                        continue
                     rise = int(round((1 - ease_out_cubic(prog)) * LINE_RISE_PIXELS))
                     y = line_layer["y"] - rise
                     layer = line_layer["layer"]
@@ -1134,9 +1347,8 @@ def build_video(telugu_text, english_text, explanation_text):
 
         frame_arr = np.array(frame, dtype=np.float32)
         if glow_frames is not None:
-            # Flash Entry Glow: strength peaks at start of video, then settles
-            flash = 1.0 + 2.0 * math.exp(-t * 2.0)
-            frame_arr += glow_frames[0] * GLOW_STRENGTH * flash
+            gi = 0  # static edge glow: always the single frame
+            frame_arr += glow_frames[gi]
 
         return np.clip(frame_arr, 0, 255).astype(np.uint8)
 
@@ -1179,16 +1391,65 @@ def build_video(telugu_text, english_text, explanation_text):
         fps=FPS,
         codec="libx264",
         audio_codec="aac",
-        bitrate="10M",
-        preset="medium",
+        bitrate="18M",
+        preset="slow",
         threads=4,
         ffmpeg_params=["-pix_fmt", "yuv420p"],
     )
 
-    return output_path
+    thumbnail_path = generate_thumbnail(telugu_text, english_text,
+                                         telugu_font_path, latin_font_path,
+                                         font_size)
+    return output_path, thumbnail_path
 
 
+def generate_thumbnail(telugu_text, english_text, telugu_font_path,
+                       latin_font_path, font_size):
+    """Vertical (9:16) Shorts thumbnail."""
+    thumb_size = (720, 1280)
+    bg_img = _cover_resize(create_background().resize(
+        (int(thumb_size[0] * 0.67), int(thumb_size[1] * 0.67)), _LANCZOS),
+        thumb_size)
 
+    display_text = telugu_text or english_text or "Daily Bible Verse"
+    use_telugu = is_telugu(display_text)
+    font_path = telugu_font_path if use_telugu else latin_font_path
+
+    safe_w = int(thumb_size[0] * 0.86)
+    fs = int(thumb_size[0] * 0.115)
+    fb = latin_font_path if use_telugu else None
+    lines = wrap_text(display_text, font_path, fs, safe_w, fallback_path=fb)[:3]
+
+    draw = ImageDraw.Draw(bg_img)
+    text_fill = text_accent_color()
+    line_h = int(fs * 1.4)
+    label_zone = int(fs * 0.32) + 36   # keep clear of the bottom label
+    rendered = [render_line_layer(line, font_path, fs, text_fill,
+                                  fallback_path=latin_font_path)
+                for line in lines]
+    # center on real INK geometry (layer boxes carry transparent padding)
+    boxes = [im.getbbox() or (0, 0, im.size[0], im.size[1])
+             for im, _ in rendered]
+    if boxes:
+        first_top = boxes[0][1]
+        span = (len(boxes) - 1) * line_h + boxes[-1][3] - first_top
+        top = max(0, (thumb_size[1] - label_zone - span) // 2 - first_top)
+    else:
+        top = 0
+    y = top
+    for img, _w in rendered:
+        bg_img.paste(img, ((thumb_size[0] - img.size[0]) // 2, y), img)
+        y += line_h
+
+    label_font = load_font(latin_font_path, int(fs * 0.32))
+    draw.text((36, thumb_size[1] - int(fs * 0.32) - 36), "DAILY VERSE",
+              font=label_font, fill=(235, 200, 120),
+              stroke_width=2, stroke_fill=(0, 0, 0))
+
+    timestamp = int(time.time())
+    thumbnail_path = os.path.join(THUMBNAIL_DIR, f"thumbnail_{timestamp}.jpg")
+    bg_img.convert("RGB").save(thumbnail_path, "JPEG", quality=95)
+    return thumbnail_path
 
 # ===================================================================
 # Google Sheets / YouTube integration
@@ -1346,11 +1607,17 @@ def run_test_render():
         "For God so loved the world that he gave his one and only Son, that whoever "
         "believes in him shall not perish but have eternal life. (John 3:16)"
     )
-    video_path = build_video(telugu_text, english_text, "")
+    video_path, thumbnail_path = build_video(telugu_text, english_text, "")
     print(f"Test video created at:     {video_path}")
+    print(f"Test thumbnail created at: {thumbnail_path}")
 
 
 def run_production():
+    if not _HAS_GOOGLE:
+        raise SystemExit(
+            "ERROR: production mode needs the Google API libs "
+            "(pip install google-api-python-client google-auth). "
+            "Use --test for a local render without them.")
     creds = get_user_credentials()
     sheets_service = get_sheets_service()
 
@@ -1369,8 +1636,9 @@ def run_production():
     english_text = sanitize_text(english_text)
     explanation_text = sanitize_text(explanation_text)
 
-    video_path = build_video(telugu_text, english_text, explanation_text)
+    video_path, thumbnail_path = build_video(telugu_text, english_text, explanation_text)
     print(f"Generated video: {video_path}")
+    print(f"Generated thumbnail: {thumbnail_path}")
 
     youtube_service = get_youtube_service(creds)
     vid = upload_to_youtube(youtube_service, video_path, telugu_text, english_text)
